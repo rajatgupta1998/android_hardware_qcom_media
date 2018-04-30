@@ -587,21 +587,29 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING role)
             if (eRet == OMX_ErrorNone) {
                 m_pipe_in = fds[0];
                 m_pipe_out = fds[1];
+
+                msg_thread_created = true;
+                r = pthread_create(&msg_thread_id,0, enc_message_thread, this);
+                if (r < 0) {
+                    DEBUG_PRINT_ERROR("ERROR: message_thread_enc thread creation failed");
+                    eRet = OMX_ErrorInsufficientResources;
+                    msg_thread_created = false;
+                } else {
+                    async_thread_created = true;
+                    r = pthread_create(&async_thread_id,0, venc_dev::async_venc_message_thread, this);
+                    if (r < 0) {
+                        DEBUG_PRINT_ERROR("ERROR: venc_dev::async_venc_message_thread thread creation failed");
+                        eRet = OMX_ErrorInsufficientResources;
+                        async_thread_created = false;
+
+                        msg_thread_stop = true;
+                        pthread_join(msg_thread_id,NULL);
+                        msg_thread_created = false;
+
+                    } else
+                        dev_set_message_thread_id(async_thread_id);
+                }
             }
-        }
-        msg_thread_created = true;
-        r = pthread_create(&msg_thread_id,0, enc_message_thread, this);
-        if (r < 0) {
-            eRet = OMX_ErrorInsufficientResources;
-            msg_thread_created = false;
-        } else {
-            async_thread_created = true;
-            r = pthread_create(&async_thread_id,0, venc_dev::async_venc_message_thread, this);
-            if (r < 0) {
-                eRet = OMX_ErrorInsufficientResources;
-                async_thread_created = false;
-            } else
-                dev_set_message_thread_id(async_thread_id);
         }
     }
 
@@ -1178,6 +1186,31 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                 break;
 
             }
+        case OMX_GoogleAndroidIndexAllocateNativeHandle:
+            {
+                VALIDATE_OMX_PARAM_DATA(paramData, AllocateNativeHandleParams);
+
+                AllocateNativeHandleParams* allocateNativeHandleParams = (AllocateNativeHandleParams *) paramData;
+
+                if (!secure_session) {
+                    DEBUG_PRINT_ERROR("Enable/Disable allocate-native-handle allowed only in secure session");
+                    eRet = OMX_ErrorUnsupportedSetting;
+                    break;
+                } else if (allocateNativeHandleParams->nPortIndex != PORT_INDEX_OUT) {
+                    DEBUG_PRINT_ERROR("Enable/Disable allocate-native-handle allowed only on Output port!");
+                    eRet = OMX_ErrorUnsupportedSetting;
+                    break;
+                } else if (m_out_mem_ptr) {
+                    DEBUG_PRINT_ERROR("Enable/Disable allocate-native-handle is not allowed since Output port is not free !");
+                    eRet = OMX_ErrorInvalidState;
+                    break;
+                }
+
+                if (allocateNativeHandleParams != NULL) {
+                    allocate_native_handle = allocateNativeHandleParams->enable;
+                }
+                break;
+            }
         case OMX_IndexParamVideoQuantization:
             {
                 VALIDATE_OMX_PARAM_DATA(paramData, OMX_VIDEO_PARAM_QUANTIZATIONTYPE);
@@ -1300,14 +1333,9 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                         }
                     }
                 } else if (pParam->nPortIndex == PORT_INDEX_OUT && secure_session) {
-                    if (pParam->bStoreMetaData != meta_mode_enable) {
-                        if (!handle->venc_set_meta_mode(pParam->bStoreMetaData)) {
-                            DEBUG_PRINT_ERROR("\nERROR: set Metabuffer mode %d fail",
-                                    pParam->bStoreMetaData);
+                            DEBUG_PRINT_ERROR("set_parameter: metamode is "
+                            "valid for input port only in secure session");
                             return OMX_ErrorUnsupportedSetting;
-                        }
-                        meta_mode_enable = pParam->bStoreMetaData;
-                    }
                 } else {
                     DEBUG_PRINT_ERROR("set_parameter: metamode is "
                             "valid for input port only");
@@ -2067,11 +2095,15 @@ OMX_ERRORTYPE  omx_venc::component_deinit(OMX_IN OMX_HANDLETYPE hComp)
         DEBUG_PRINT_ERROR("WARNING:Rxd DeInit,OMX not in LOADED state %d",\
                 m_state);
     }
+
+    auto_lock l(m_buf_lock);
     if (m_out_mem_ptr) {
         DEBUG_PRINT_LOW("Freeing the Output Memory");
         for (i=0; i< m_sOutPortDef.nBufferCountActual; i++ ) {
             if (BITMASK_PRESENT(&m_out_bm_count, i)) {
                 BITMASK_CLEAR(&m_out_bm_count, i);
+                if (BITMASK_PRESENT(&m_client_out_bm_count, i))
+                    BITMASK_CLEAR(&m_client_out_bm_count, i);
                 free_output_buffer (&m_out_mem_ptr[i]);
             }
 
@@ -2084,16 +2116,20 @@ OMX_ERRORTYPE  omx_venc::component_deinit(OMX_IN OMX_HANDLETYPE hComp)
     }
 
     /*Check if the input buffers have to be cleaned up*/
-    if (m_inp_mem_ptr
+    OMX_BUFFERHEADERTYPE* ptr = m_inp_mem_ptr;
 #ifdef _ANDROID_ICS_
-            && !meta_mode_enable
+    if (meta_mode_enable) {
+        ptr = meta_buffer_hdr;
+    }
 #endif
-       ) {
+    if (ptr) {
         DEBUG_PRINT_LOW("Freeing the Input Memory");
         for (i=0; i<m_sInPortDef.nBufferCountActual; i++ ) {
             if (BITMASK_PRESENT(&m_inp_bm_count, i)) {
                 BITMASK_CLEAR(&m_inp_bm_count, i);
-                free_input_buffer (&m_inp_mem_ptr[i]);
+                if (BITMASK_PRESENT(&m_client_in_bm_count, i))
+                    BITMASK_CLEAR(&m_client_in_bm_count, i);
+                free_input_buffer(ptr + i);
             }
 
             if (release_input_done()) {
@@ -2101,8 +2137,8 @@ OMX_ERRORTYPE  omx_venc::component_deinit(OMX_IN OMX_HANDLETYPE hComp)
             }
         }
 
-
-        free(m_inp_mem_ptr);
+        if (m_inp_mem_ptr != meta_buffer_hdr)
+            free(m_inp_mem_ptr);
         m_inp_mem_ptr = NULL;
     }
 
@@ -2374,10 +2410,17 @@ int omx_venc::async_message_process (void *context, void* message)
                     OMX_COMPONENT_GENERATE_EBD);
             break;
         case VEN_MSG_OUTPUT_BUFFER_DONE:
+        {
             omxhdr = (OMX_BUFFERHEADERTYPE*)m_sVenc_msg->buf.clientdata;
+            OMX_U32 bufIndex = (OMX_U32)(omxhdr - omx->m_out_mem_ptr);
 
             if ( (omxhdr != NULL) &&
-                    ((OMX_U32)(omxhdr - omx->m_out_mem_ptr)  < omx->m_sOutPortDef.nBufferCountActual)) {
+                    (bufIndex  < omx->m_sOutPortDef.nBufferCountActual)) {
+                auto_lock l(omx->m_buf_lock);
+                if (BITMASK_ABSENT(&(omx->m_out_bm_count), bufIndex)) {
+                    DEBUG_PRINT_ERROR("Recieved FBD for buffer that is already freed !");
+                    break;
+                }
                 if (!omx->is_secure_session() && (m_sVenc_msg->buf.len <=  omxhdr->nAllocLen)) {
                     omxhdr->nFilledLen = m_sVenc_msg->buf.len;
                     omxhdr->nOffset = m_sVenc_msg->buf.offset;
@@ -2386,20 +2429,30 @@ int omx_venc::async_message_process (void *context, void* message)
                     omxhdr->nFlags = m_sVenc_msg->buf.flags;
 
                     /*Use buffer case*/
-                    if (omx->output_use_buffer && !omx->m_use_output_pmem && !omx->is_secure_session()) {
+                    if (BITMASK_PRESENT(&(omx->m_client_out_bm_count), bufIndex) &&
+                        omx->output_use_buffer && !omx->m_use_output_pmem && !omx->is_secure_session()) {
                         DEBUG_PRINT_LOW("memcpy() for o/p Heap UseBuffer");
                         memcpy(omxhdr->pBuffer,
                                 (m_sVenc_msg->buf.ptrbuffer),
                                 m_sVenc_msg->buf.len);
                     }
                 } else if (omx->is_secure_session()) {
-                    output_metabuffer *meta_buf = (output_metabuffer *)(omxhdr->pBuffer);
-                    native_handle_t *nh = meta_buf->nh;
-                    nh->data[1] = m_sVenc_msg->buf.offset;
-                    nh->data[2] = m_sVenc_msg->buf.len;
-                    omxhdr->nFilledLen = sizeof(output_metabuffer);
-                    omxhdr->nTimeStamp = m_sVenc_msg->buf.timestamp;
-                    omxhdr->nFlags = m_sVenc_msg->buf.flags;
+                    if (omx->allocate_native_handle) {
+                        native_handle_t *nh = (native_handle_t *)(omxhdr->pBuffer);
+                        nh->data[1] = m_sVenc_msg->buf.offset;
+                        nh->data[2] = m_sVenc_msg->buf.len;
+                        omxhdr->nFilledLen = m_sVenc_msg->buf.len;
+                        omxhdr->nTimeStamp = m_sVenc_msg->buf.timestamp;
+                        omxhdr->nFlags = m_sVenc_msg->buf.flags;
+                    } else {
+                        output_metabuffer *meta_buf = (output_metabuffer *)(omxhdr->pBuffer);
+                        native_handle_t *nh = meta_buf->nh;
+                        nh->data[1] = m_sVenc_msg->buf.offset;
+                        nh->data[2] = m_sVenc_msg->buf.len;
+                        omxhdr->nFilledLen = sizeof(output_metabuffer);
+                        omxhdr->nTimeStamp = m_sVenc_msg->buf.timestamp;
+                        omxhdr->nFlags = m_sVenc_msg->buf.flags;
+                    }
                 } else {
                     omxhdr->nFilledLen = 0;
                 }
@@ -2411,6 +2464,7 @@ int omx_venc::async_message_process (void *context, void* message)
             omx->post_event ((unsigned long)omxhdr,m_sVenc_msg->statuscode,
                     OMX_COMPONENT_GENERATE_FBD);
             break;
+        }
         case VEN_MSG_NEED_OUTPUT_BUFFER:
             //TBD what action needs to be done here??
             break;

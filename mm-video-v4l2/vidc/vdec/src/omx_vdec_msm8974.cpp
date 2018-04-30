@@ -198,6 +198,7 @@ void* async_message_thread (void *input)
                 vdec_msg.msgcode=VDEC_MSG_RESP_INPUT_BUFFER_DONE;
                 vdec_msg.status_code=VDEC_S_SUCCESS;
                 vdec_msg.msgdata.input_frame_clientdata=(void*)&v4l2_buf;
+                omx->ebd_count++;
                 if (omx->async_message_process(input,&vdec_msg) < 0) {
                     DEBUG_PRINT_HIGH("async_message_thread Exited");
                     break;
@@ -744,6 +745,7 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
     m_smoothstreaming_mode = false;
     m_smoothstreaming_width = 0;
     m_smoothstreaming_height = 0;
+    etb_count = ebd_count = 0;
     is_q6_platform = false;
     m_perf_control.send_hint_to_mpctl(true);
     m_client_color_space.nPortIndex = (OMX_U32)OMX_CORE_INPUT_PORT_INDEX;
@@ -1229,7 +1231,7 @@ void omx_vdec::process_event_cb(void *ctxt, unsigned char id)
 
                 case OMX_COMPONENT_GENERATE_EVENT_INPUT_FLUSH:
                                         DEBUG_PRINT_HIGH("Driver flush i/p Port complete");
-                                        if (!pThis->input_flush_progress) {
+                                        if (!pThis->input_flush_progress || (pThis->etb_count > pThis->ebd_count)) {
                                             DEBUG_PRINT_HIGH("WARNING: Unexpected flush from driver");
                                         } else {
                                             pThis->execute_input_flush();
@@ -5040,7 +5042,6 @@ void omx_vdec::free_extradata()
         close(drv_ctx.extradata_info.ion.fd_ion_data.fd);
         free_ion_memory(&drv_ctx.extradata_info.ion);
     }
-    memset(&drv_ctx.extradata_info, 0, sizeof(drv_ctx.extradata_info));
 #endif
     if (m_other_extradata) {
         free(m_other_extradata);
@@ -6746,7 +6747,7 @@ if (buffer->nFlags & QOMX_VIDEO_BUFFERFLAG_EOSEQ) {
         DEBUG_PRINT_ERROR("Failed to qbuf Input buffer to driver");
         return OMX_ErrorHardware;
     }
-
+    etb_count++;
     if (codec_config_flag && !(buffer->nFlags & OMX_BUFFERFLAG_CODECCONFIG)) {
         codec_config_flag = false;
     }
@@ -7051,8 +7052,10 @@ OMX_ERRORTYPE  omx_vdec::set_callbacks(OMX_IN OMX_HANDLETYPE        hComp,
 OMX_ERRORTYPE  omx_vdec::component_deinit(OMX_IN OMX_HANDLETYPE hComp)
 {
    (void) hComp;
-
+    OMX_ERRORTYPE nRet = OMX_ErrorNone;
+    OMX_BUFFERHEADERTYPE *buffer;
     unsigned i = 0;
+
     if (OMX_StateLoaded != m_state) {
         DEBUG_PRINT_ERROR("WARNING:Rxd DeInit,OMX not in LOADED state %d",\
                 m_state);
@@ -7062,14 +7065,16 @@ OMX_ERRORTYPE  omx_vdec::component_deinit(OMX_IN OMX_HANDLETYPE hComp)
     }
 
     /*Check if the output buffers have to be cleaned up*/
-    if (m_out_mem_ptr) {
+    buffer = client_buffers.get_il_buf_hdr();
+    if (buffer) {
         DEBUG_PRINT_LOW("Freeing the Output Memory");
         for (i = 0; i < drv_ctx.op_buf.actualcount; i++ ) {
             if (BITMASK_PRESENT(&m_out_bm_count, i)) {
                 BITMASK_CLEAR(&m_out_bm_count, i);
-                client_buffers.free_output_buffer (&m_out_mem_ptr[i]);
+                nRet = client_buffers.free_output_buffer (buffer+i);
+                if (OMX_ErrorNone != nRet)
+                    break;
             }
-
             if (release_output_done()) {
                 break;
             }
@@ -11141,6 +11146,8 @@ OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::free_output_buffer(
     if (enabled && omx->is_component_secure())
         return OMX_ErrorNone;
     if (!allocated_count || !bufhdr) {
+        for (unsigned i = 0; i < omx->drv_ctx.op_buf.actualcount; i++)
+            omx->free_output_buffer(&omx->m_out_mem_ptr[i]);
         DEBUG_PRINT_ERROR("Color convert no buffer to be freed %p",bufhdr);
         return OMX_ErrorBadParameter;
     }

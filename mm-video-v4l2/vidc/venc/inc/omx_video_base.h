@@ -652,6 +652,7 @@ class omx_video: public qc_omx_component
         omx_cmd_queue m_opq_meta_q;
         omx_cmd_queue m_opq_pmem_q;
         OMX_BUFFERHEADERTYPE meta_buffer_hdr[MAX_NUM_INPUT_BUFFERS];
+        pthread_mutex_t m_buf_lock;
 
         bool input_flush_progress;
         bool output_flush_progress;
@@ -660,7 +661,11 @@ class omx_video: public qc_omx_component
         int pending_input_buffers;
         int pending_output_buffers;
 
+        bool allocate_native_handle;
+
         uint64_t m_out_bm_count;
+        uint64_t m_client_out_bm_count;
+        uint64_t m_client_in_bm_count;
         uint64_t m_inp_bm_count;
         uint64_t m_flags;
         uint64_t m_etb_count;
@@ -675,6 +680,7 @@ class omx_video: public qc_omx_component
         extra_data_handler extra_data_handle;
         bool hw_overload;
 
+        bool m_buffer_freed;
 };
 
 #endif // __OMX_VIDEO_BASE_H__
